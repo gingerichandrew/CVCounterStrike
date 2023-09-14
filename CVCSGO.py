@@ -1,33 +1,39 @@
 import mss
 import cv2
 import math
-import serial
 import time
 import torch
 import numpy as np
-import yaml
-import win32gui, win32con, win32api, win32ui
+import win32con, win32api
 import multiprocessing
-import seaborn as sn
 import tensorrt as trt
 from random import *
 from multiprocessing    import Process, Queue
-from torchvision        import models
-from numpy              import random
-from PIL                import ExifTags, Image, ImageOps
 
+# Image size for screenshot/model size
 imgsz = 416
+# Resolution of the screen
 screenWidth = 1920
 screenHeight = 1080
+# Padding for adjusing coordinates(as screenshot is not entire screen)
 XPAD = (screenWidth / 2) - (imgsz / 2)
 YPAD = (screenHeight / 2) - (imgsz / 2)
 
+def screenshot(left, top, width, height):
+    with mss.mss() as sct:
+        # The screen part to capture
+        monitor = {'top': top, 'left': left, 'width': width, 'height': height}
+        # Get raw pixels from the screen, save it to a Numpy array
+        img = np.array(sct.grab(monitor))
+        return img
+    
+# Source (https://github.com/ultralytics/yolov5)
 def make_divisible(x, divisor):
     # Returns nearest x divisible by divisor
     if isinstance(divisor, torch.Tensor):
         divisor = int(divisor.max())  # to int
     return math.ceil(x / divisor) * divisor
-
+# Source (https://github.com/ultralytics/yolov5)
 def check_img_size(imgsz, s=1, floor=0):
     # Verify image size is a multiple of stride s in each dimension
     if isinstance(imgsz, int):  # integer i.e. img_size=640
@@ -38,7 +44,7 @@ def check_img_size(imgsz, s=1, floor=0):
     if new_size != imgsz:
         LOGGER.warning(f'WARNING ⚠️ --img-size {imgsz} must be multiple of max stride {s}, updating to {new_size}')
     return new_size
-
+# Source (https://github.com/ultralytics/yolov5)
 def letterbox(im, new_shape=416, color=(114, 114, 114), auto=True, scaleFill=False, scaleup=True, stride=32):
     # Resize and pad image while meeting stride-multiple constraints
     shape = im.shape[:2]  # current shape [height, width]
@@ -110,25 +116,21 @@ class LoadScreenshots:
 
 def computer_vision(queue):
     imgsz=416
-    model = torch.hub.load('./', 'custom', path='./CustomModel/best.engine', source='local')  # local repo
+    # Load custom trained model
+    model = torch.hub.load('./', 'custom', path='./player_models/nano/best.engine', source='local')  # local repo
     stride, names, pt = model.stride, model.names, model.pt
     imgsz = check_img_size(imgsz, s=stride)  # check image size
+    # Capture main moniter, in a cropped 416x416 center
     dataset = LoadScreenshots("screen 1 752 332 416 416", img_size=imgsz, stride=stride, auto=pt)
 
+    print('Computer Vision: Ready')
     for path, im, im0s, vid_cap, s in dataset:
+        # Get inference from screenshot
         pred = model(im, imgsz)
+        # Put inference in queue(pipe) for AimLoop to consume
         queue.put(pred)
-        #print('\n',pred,'\n')
 
 def mouse_move(queue_m):
-    arduino = None
-    # Attempt to setup serial communication over com-port
-    try:
-        arduino = serial.Serial('COM5', 115200)
-        print('Arduino: Ready')
-    except:
-        print('Arduino: Could not open serial port - Now using virtual input')
-
     print("Mouse Process: Ready")
     while True:
         # Check if there is data waiting in the queue
@@ -138,23 +140,14 @@ def mouse_move(queue_m):
         except:
             print('Empty')
             continue
-        # If using arduino, convert cooridnates
-        if(arduino):
-            if out_x < 0: 
-                out_x = out_x + 256 
-            if out_y < 0:
-                out_y = out_y + 256 
-            pax = [int(out_x), int(out_y), int(click)]
-            # Send data to microcontroller to move mouse
-            arduino.write(pax)          
-        else:
-            # Move mouse virtually
-            win32api.mouse_event(win32con.MOUSEEVENTF_MOVE, int(out_x), int(out_y), 0, 0)
-            if (click == 1):
-                win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN,0,0)
-                time.sleep(.1)
-                win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP,0,0)
-                print('Left Click')
+        # Move mouse to coordinates
+        win32api.mouse_event(win32con.MOUSEEVENTF_MOVE, int(out_x), int(out_y), 0, 0)
+        # If mouse should click
+        if (click == 1):
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN,0,0)
+            time.sleep(.1)
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP,0,0)
+            print('Left Click')
 
 # More accurate sleep(Performance hit)
 def sleep_time(wt):
@@ -182,28 +175,29 @@ def lerp(wt, ct, x1, y1, start, queue_m):
 
 def aim_loop(queue,queue_m):
     aim_cone = 30
-    aimToggle = False
-    awp_toggle = False
+    bot_running = True
+    body_toggle = False
+
+    # Coordinates of the center of the screen
     mPosX, mPosY = screenWidth/2, screenHeight/2
 
+    # Debug to show user what parameters on on by default
     print('AimLoop: Ready')
+    print("AimLoop: Bot On")
+    print("AimLoop: Head Enabled")
     while True:
         try:
             item = queue.get()
         except Empty:
             print('AimLoop: gave up waiting...')
             continue
-        start = time.perf_counter()
-        closest_head = aim_cone
-        moveByX = 0
-        moveByY = 0
-        largest = 0
-        x1s, x2s, y1s, y2s = 0, 0, 0, 0
-        distance = 0
-        horizontal_d = 0
-        verticle_d = 0
-        closest_x = aim_cone
-        closest_y = aim_cone
+
+        # Used to determine which target is the closest
+        moveByX, moveByY = 0, 0
+        largest, distance = 0, 0
+        horizontal_d, verticle_d = 0, 0
+        closest_x, closest_y, closest_head = aim_cone, aim_cone, aim_cone
+
         for *xyxy, conf, cls in item.xyxy[0]:
             x1, x2, y1, y2 = xyxy[0].tolist() + XPAD, xyxy[2].tolist() + XPAD, xyxy[1].tolist() + YPAD, xyxy[3].tolist() + YPAD
             xC, yC = (x1 + x2) / 2 , (y1 + y2) / 2
@@ -212,54 +206,65 @@ def aim_loop(queue,queue_m):
             horizontal_d = abs(xC - mPosX)
             verticle_d = abs(yC - mPosY)
             size = (x2 - x1) * (y2 - y1)
+            # If detection is a head or body (regardless if enemy or friendly)
             if(cls_ == 1 or cls_ == 3):
-                if(distance < aim_cone and distance < closest_head and size > largest or (awp_toggle and horizontal_d < aim_cone and size > largest)):
+                if(distance < aim_cone and distance < closest_head and size > largest or (body_toggle and horizontal_d < aim_cone and size > largest)):
                     largest = size
                     closest_head = distance
                     moveByX = xC - mPosX
                     moveByY = yC - mPosY
 
-        if(aimToggle and (moveByX != 0 or moveByY != 0)):
-            if (awp_toggle):
-                queue_m.put([moveByX/2, 0, 0])
+        # If bot is running, and there is detections that warrent mouse movement
+        if(bot_running and (moveByX != 0 or moveByY != 0)):
+            if (body_toggle):
+                queue_m.put([moveByX/2, 0, 0]) # Move only horizontally(body)
             else:
-                #queue_m.put([moveByX/2, moveByY/2, 0])
-                queue_m.put([moveByX/1.5, moveByY/1.5, 0])
-            #lerp(2, 2, moveByX/1.5, moveByY/1.5, start, queue_m)
-            #lerp(2, 2, moveByX/2.5, 0, start, queue_m)
+                queue_m.put([moveByX/1.5, moveByY/1.5, 0]) # Move both horizontally and vertically(head)
+
+        # Up Arrow
         if(win32api.GetAsyncKeyState(38)):
             aim_cone += 5
-            print("Aim Cone now: ", aim_cone,"px")
-            time.sleep(.1)
+            print("AimLoop: Aim Cone now: ", aim_cone,"px")
+            while(win32api.GetAsyncKeyState(38) < 0):
+                continue
+        # Down Arrow
         if(win32api.GetAsyncKeyState(40)):
             aim_cone -= 5
-            print("Aim Cone now: ", aim_cone,"px")
-            time.sleep(.1)
+            print("AimLoop: Aim Cone now: ", aim_cone,"px")
+            while(win32api.GetAsyncKeyState(40) < 0):
+                continue
+        
+        # Mouse Button #2
         if(win32api.GetAsyncKeyState(5)):
-            if(aimToggle):
-                aimToggle = False
-                print("Aimbot Off")
-                time.sleep(.2)
+            if(bot_running):
+                bot_running = False
+                print("AimLoop: Bot Off")
+                while(win32api.GetAsyncKeyState(5) < 0):
+                    continue
             else:
-                aimToggle = True
-                print("Aimbot On")
-                time.sleep(.2)
+                bot_running = True
+                print("AimLoop: Bot On")
+                while(win32api.GetAsyncKeyState(5) < 0):
+                    continue
+        # X Key
         if(win32api.GetAsyncKeyState(0x58)):
-            if(awp_toggle):
-                awp_toggle = False
-                print("awp_toggle Off")
-                time.sleep(.2)
+            if(body_toggle):
+                body_toggle = False
+                print("AimLoop: Head Enabled")
+                while(win32api.GetAsyncKeyState(0x58) < 0):
+                    continue
             else:
-                awp_toggle = True
-                print("awp_toggle On")
-                time.sleep(.2)
+                body_toggle = True
+                print("AimLoop: Body Enabled")
+                while(win32api.GetAsyncKeyState(0x58) < 0):
+                    continue
             
 
 if __name__ == '__main__':
     multiprocessing.freeze_support()
-
+    # Queue to communicate inferences
     queue = Queue(1)
-    # Queue to communicate mouse movements, Recoil -> queue_m -> Mouse
+    # Queue to communicate mouse movements, AimLoop -> queue_m -> Mouse
     queue_m = Queue(1)
 
     # Start Mouse process, handles sending mouse out data, communicate with using queue_m
@@ -267,9 +272,11 @@ if __name__ == '__main__':
     mouse.daemon = True
     mouse.start()
 
+    # Start AimLoop process
     consumer = Process(target=aim_loop, args=(queue,queue_m,))
     consumer.daemon = True
     consumer.start()
 
+    # Main process running inferences
     computer_vision(queue)
 
